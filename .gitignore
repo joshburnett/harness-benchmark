@@ -1,0 +1,5 @@
+.venv/
+__pycache__/
+.pytest_cache/
+# Benchmark results are data, not code; copy runs/ between machines to compare.
+runs/
