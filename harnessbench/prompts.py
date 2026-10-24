@@ -6,7 +6,7 @@ import sys
 import time
 from pathlib import Path
 
-from harnessbench import runs
+from harnessbench import clipboard, runs
 
 SHELLS = ("powershell", "pwsh", "gitbash", "bash", "zsh")
 FILLER = (
@@ -94,6 +94,20 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         "--python", default=sys.executable, help="interpreter the agent runs"
     )
     parser.add_argument("--notes", default="")
+    parser.add_argument(
+        "--no-copy", action="store_true", help="don't copy the prompt to the clipboard"
+    )
+
+
+def copy_to_clipboard(prompt: str) -> None:
+    try:
+        method = clipboard.copy(prompt)
+    except OSError as exc:
+        print(
+            f"# could not copy the prompt to the clipboard ({exc}); copy it from prompt.txt"
+        )
+        return
+    print(f"# prompt copied to the clipboard via {method}")
 
 
 def save_run(
@@ -117,3 +131,5 @@ def save_run(
     print(f"# run id: {run_id}")
     print(f"# prompt saved to {directory / 'prompt.txt'}")
     print(f"# afterwards: python analyze.py --run {run_id}")
+    if not args.no_copy:
+        copy_to_clipboard(prompt)

@@ -146,8 +146,20 @@ The examples below use `python` for the virtual environment's interpreter
    | `--spawn-bench` | off | Ends the run with `spawn_bench.py --quick` from inside the harness |
    | `--python` | current interpreter | Interpreter the agent's commands use |
    | `--notes` | empty | Free text saved in `meta.json` |
+   | `--no-copy` | off | Don't copy the prompt to the clipboard |
 
-   The prompt is printed and saved as `runs/<run-id>/prompt.txt`.
+   The prompt is printed, saved as `runs/<run-id>/prompt.txt`, and copied to the
+   clipboard. The last output line says which method was used:
+
+   | Host | Clipboard method, in order of preference |
+   |---|---|
+   | Windows | Win32 clipboard API (no extra process), then `clip.exe` |
+   | macOS | `pbcopy` |
+   | WSL | `clip.exe`, so the prompt lands on the Windows clipboard, then the Linux tools below |
+   | Linux | `wl-copy` (Wayland), `xclip` or `xsel` (X11); install one of them if none is present |
+   | Any terminal | OSC 52 escape sequence as a last resort, which only works in terminals that support it |
+
+   If nothing works, the script says so; copy the prompt from `prompt.txt`.
 
 2. Prepare the harness:
    - Open **this folder** as the workspace / project.
@@ -162,7 +174,8 @@ The examples below use `python` for the virtual environment's interpreter
      prompt tells the agent to use only built-in tools, but not every model
      obeys.
    - Start a **new chat** for each run.
-3. Paste the prompt and wait for the agent to reply `DONE`.
+3. Paste the prompt (it's already on the clipboard) and wait for the agent to
+   reply `DONE`.
 4. Check the result:
 
    ```bash
@@ -237,7 +250,8 @@ python make_completion_prompt.py ... --variants line many-lines bg-holds-output 
 | `--seed` | random | Shuffle seed, saved in `meta.json` |
 
 It also takes `--harness`, `--model`, `--env`, `--shell`, `--python` and
-`--notes`, the same as `make_prompt.py`. The harness setup is the same as for the
+`--notes` and `--no-copy`, and copies the prompt to the clipboard, the same as
+`make_prompt.py`. The harness setup is the same as for the
 dispatch benchmark: open this folder, auto-approve, fixed low reasoning, no MCP
 servers, new chat. Then check the run with `python analyze.py --run <run-id>`.
 
@@ -441,7 +455,7 @@ shown in the table.
 ## Project layout
 
 ```text
-harnessbench/      shared library: process info, timing, prompts, run storage, stats, analysis
+harnessbench/      shared library: process info, timing, prompts, clipboard, run storage, stats, analysis
 probe.py           agent-invoked dispatch probe
 make_prompt.py     creates a dispatch run and its prompt
 complete_probe.py  agent-invoked completion-detection probe (command-behavior variants)
