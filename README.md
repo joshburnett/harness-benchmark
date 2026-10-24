@@ -65,16 +65,21 @@ probe done ─(model + harness, no process started)─► marker i+1 written
 | Metric | Meaning |
 |---|---|
 | `pre_create` | Marker i written to shell process created: the model turn plus harness dispatch |
+| `shell_to_exec` | Shell created to Python process created: `shell_init` + `exec_launch`, measured from process creation times only, so it works in every shell |
 | `shell_init` | Shell created to first command running: profile, rc files, security inspection |
 | `exec_launch` | Shell ready to Python process created: launching an executable from the shell |
 | `py_init` | Python created to its first line: loading the program and starting the interpreter |
 | `turn_native` | Probe done to next marker written: the turn gap when the next tool starts no process |
-| `turn_shell` | Marker written to shell ready: the turn gap when the next tool starts a shell |
+| `turn_shell` | Marker written to Python process created: the turn gap when the next tool starts a shell |
 | `shell_overhead` | Median `turn_shell` minus median `turn_native`: what a shell tool call costs, net of the model |
 
+`shell_init` and `exec_launch` split `shell_to_exec` using the shell's own "ready"
+timestamp. Shells without a sub-second clock (macOS's `/bin/bash` 3.2) leave
+them blank; compare harnesses on `shell_to_exec` instead.
+
 If a harness reuses one long-lived shell, the shell's creation time is earlier
-than the previous step. Those calls are flagged `reused`, and `shell_init` isn't
-reported for them.
+than the previous step. Those calls are flagged `reused`, and `shell_to_exec`
+and `shell_init` aren't reported for them.
 
 ## Scripts
 
@@ -124,7 +129,7 @@ The examples below use `python` for the virtual environment's interpreter
    | `--harness` | required | Free text label: `cursor-gui`, `cursor-cli`, `cline`, `pi`, `opencode`, `claude-code` |
    | `--model` | required | Free text label for the model selected in the harness |
    | `--env` | hostname + OS | Use consistent labels: `corp-win`, `corp-wsl`, `corp-vm`, `mac` |
-   | `--shell` | `powershell` on Windows, else `$SHELL` | One of `powershell`, `pwsh`, `gitbash`, `bash`, `zsh`. Must match the shell the harness runs commands in |
+   | `--shell` | `powershell` on Windows, else `$SHELL` | One of `powershell`, `pwsh`, `gitbash`, `bash`, `zsh`. PowerShell vs POSIX must match the harness's shell; `bash` and `zsh` produce the same command, which works in either. `gitbash` uses forward-slash Windows paths |
    | `--calls` | 12 | Number of shell probe calls |
    | `--mode` | `alternate` | `shell-only` skips the WRITE steps, so `turn_native` and `shell_overhead` aren't measured |
    | `--spawn-bench` | off | Ends the run with `spawn_bench.py --quick` from inside the harness |
@@ -139,6 +144,12 @@ The examples below use `python` for the virtual environment's interpreter
      measure your own click time.
    - Choose the model and a **fixed, low (or no) reasoning setting**. Reasoning
      tokens add to every turn.
+   - **Disable MCP servers** (or keep the same set everywhere and note it in
+     `--notes`). Running apps can expose MCP tools, e.g. an open JetBrains IDE.
+     The model may call them instead of the built-in tools, and every tool
+     definition adds prompt tokens to every turn even when it's unused. The
+     prompt tells the agent to use only built-in tools, but not every model
+     obeys.
    - Start a **new chat** for each run.
 3. Paste the prompt and wait for the agent to reply `DONE`.
 4. Check the result:
@@ -147,8 +158,9 @@ The examples below use `python` for the virtual environment's interpreter
    python analyze.py --run <run-id>
    ```
 
-   There should be one probe row per call. If marker files are missing or
-   steps are out of order, the agent didn't follow the prompt; rerun it.
+   There should be one probe row per call. Lines starting with `INVALID:` mean
+   the agent didn't follow the prompt (a failed, skipped, retried, or reordered
+   step), so its timings aren't comparable. Rerun it.
 
 ### CLI harnesses (optional exact timing)
 
@@ -258,7 +270,7 @@ in provider load over time cancel out. Compare medians and p90.
 | Question | Keep fixed | Vary | Look at |
 |---|---|---|---|
 | Is security software slowing process startup? Does its cache expire? | machine | Windows vs WSL vs Linux VM; idle period | `spawn_bench` first/repeat, idle table, new vs same script |
-| How much do the environment and shell cost per tool call? | harness, model | corp-win PowerShell / Git Bash / WSL / VM, Mac | `shell_init`, `exec_launch`, `py_init`, `shell_overhead` |
+| How much do the environment and shell cost per tool call? | harness, model | corp-win PowerShell / Git Bash / WSL / VM, Mac | `shell_to_exec` (split into `shell_init` / `exec_launch`), `py_init`, `shell_overhead` |
 | Which harness has the least overhead? | environment, model | harness | `turn_native`, `shell_overhead`, `reused` |
 | How much does the model matter? | environment, harness | model | `turn_native`, `llm_probe` time to first token and tokens/s |
 | Is Cursor's "taking longer than normal" local or backend? | harness = Cursor, model | Mac vs corp-win, in the same hour | `turn_native`, `net_probe` issuer/HTTP/2/api2.cursor.sh, `llm_probe` buffering |
@@ -282,10 +294,23 @@ Copy `runs/` from every machine into one checkout, then:
 python analyze.py                     # all agent runs + spawn/net/LLM comparisons
 python analyze.py --run <run-id>      # per-call breakdown for one run
 python analyze.py --csv summary.csv   # agent-run summary for spreadsheets
+python analyze.py --include-invalid   # also show runs that failed validation
 ```
 
 Agent-run summaries exclude the first call, which includes cold-start effects.
 The per-run detail view includes it.
+
+Each agent run is checked against its prompt. A run is invalid if any of these
+happened:
+
+- probes are missing or repeated (skipped or retried shell steps)
+- marker files are missing (a failed or skipped write, e.g. an attempt through
+  an MCP tool)
+- steps ran out of order (e.g. tool calls made in parallel)
+
+Invalid runs are listed with their problems and left out of the summary table and
+CSV unless `--include-invalid` is given. Runs with no probes at all are never
+shown in the table.
 
 ## Caveats
 
@@ -305,9 +330,12 @@ The per-run detail view includes it.
   provider-only reference.
 - **Token parity is approximate:** the WRITE and RUN steps' output token counts
   are close but not identical, and harnesses wrap tools differently.
-- **Older bash:** macOS's built-in bash 3.2 has no `$EPOCHREALTIME`. `shell_init`
-  is then unavailable, and `turn_shell` falls back to Python's creation time.
-  Git Bash and Linux bash 5 are fine.
+- **Older bash:** macOS's built-in `/bin/bash` 3.2 (used by Cline, for example) has
+  no `$EPOCHREALTIME`, so `shell_init` and `exec_launch` are blank and
+  `analyze.py --run` prints a note. `shell_to_exec` and every other metric are
+  unaffected. Git Bash and Linux bash 5 are fine.
+- **Harness shell vs your login shell:** a harness may not use your `$SHELL`.
+  The per-run reports show the shell actually observed in the process chain.
 
 ## Project layout
 

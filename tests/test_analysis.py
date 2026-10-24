@@ -44,10 +44,11 @@ def test_alternate_mode_components():
     probes = [probe(1, 3000 * MS, 4500 * MS, 4600 * MS, 4700 * MS, 4800 * MS)]
     row = analysis.call_rows(probes, markers, "alternate")[0]
     assert row["pre_create_ms"] == 2000
+    assert row["shell_to_exec_ms"] == 1600
     assert row["shell_init_ms"] == 1500
     assert row["exec_launch_ms"] == 100
     assert row["py_init_ms"] == 100
-    assert row["turn_to_shell_ms"] == 3500
+    assert row["turn_to_shell_ms"] == 3600
     assert row["turn_to_native_ms"] == 1200
     assert row["reused_shell"] is False
 
@@ -58,7 +59,60 @@ def test_reused_shell_is_flagged_and_not_counted_as_startup():
     row = analysis.call_rows(probes, markers, "alternate")[0]
     assert row["reused_shell"] is True
     assert row["shell_init_ms"] is None
-    assert row["turn_to_shell_ms"] == 1000
+    assert row["shell_to_exec_ms"] is None
+    assert row["turn_to_shell_ms"] == 1010
+
+
+def test_missing_ready_stamp_still_gives_shell_to_exec():
+    markers = {1: 1000 * MS}
+    probes = [probe(1, 3000 * MS, None, 3010 * MS, 3030 * MS, 3040 * MS)]
+    row = analysis.call_rows(probes, markers, "alternate")[0]
+    assert row["shell_init_ms"] is None
+    assert row["shell_to_exec_ms"] == 10
+    assert row["turn_to_shell_ms"] == 2010
+
+
+def clean_run() -> tuple[dict, list[dict], dict[int, int]]:
+    meta = {"calls": 2, "mode": "alternate"}
+    probes = [
+        probe(1, 2000 * MS, 2100 * MS, 2110 * MS, 2130 * MS, 2140 * MS),
+        probe(2, 4000 * MS, 4100 * MS, 4110 * MS, 4130 * MS, 4140 * MS),
+    ]
+    markers = {1: 1000 * MS, 2: 3000 * MS, 3: 5000 * MS}
+    return meta, probes, markers
+
+
+def issues_for(meta: dict, probes: list[dict], markers: dict[int, int]) -> list[str]:
+    rows = analysis.call_rows(probes, markers, meta["mode"])
+    return analysis.validate(meta, probes, markers, rows)
+
+
+def test_clean_run_is_valid():
+    assert issues_for(*clean_run()) == []
+
+
+def test_skipped_marker_and_probe_are_flagged():
+    meta, probes, markers = clean_run()
+    del markers[1]
+    assert issues_for(meta, probes[1:], markers) == [
+        "missing probes [1]",
+        "missing markers [1]",
+    ]
+
+
+def test_retried_probe_is_flagged():
+    meta, probes, markers = clean_run()
+    assert issues_for(meta, [*probes, probes[1]], markers) == ["repeated probes [2]"]
+
+
+def test_out_of_order_steps_are_flagged():
+    meta, probes, markers = clean_run()
+    markers[2] = 2120 * MS
+    assert issues_for(meta, probes, markers) == ["marker 2 written before probe 1"]
+
+
+def test_empty_run_is_flagged():
+    assert analysis.validate({"calls": 2}, [], {}, []) == ["no probes recorded"]
 
 
 def test_live_ancestry_has_creation_times():

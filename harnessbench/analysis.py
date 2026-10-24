@@ -7,10 +7,12 @@ Timeline for one alternate-mode step pair (all wall-clock, same machine):
       ──(LLM + harness, native tool)──► marker i+1 written
 
   pre_create_ms   marker i -> shell process created   (LLM turn + harness dispatch)
+  shell_to_exec_ms   shell created -> python created (shell_init + exec_launch; needs no
+                     shell timestamp, so it also works in bash < 5)
   shell_init_ms   shell created -> first command runs (shell startup, profile, AV/EDR)
   exec_launch_ms  shell ready -> python process created (CreateProcess/exec from the shell)
   py_init_ms      python created -> first line of probe.py (image load + interpreter init)
-  turn_to_shell_ms   marker i -> shell ready        (whole LLM+harness+shell-start gap)
+  turn_to_shell_ms   marker i -> python created     (whole LLM+harness+shell-start gap)
   turn_to_native_ms  probe end i -> marker i+1      (same, but the next tool spawns nothing)
 
   shell_overhead_ms = median(turn_to_shell) - median(turn_to_native): what a shell
@@ -21,7 +23,13 @@ from pathlib import Path
 
 from harnessbench import procinfo, runs, stats, timing
 
-TOOL_METRICS = ["shell_init_ms", "exec_launch_ms", "py_init_ms", "probe_ms"]
+TOOL_METRICS = [
+    "shell_to_exec_ms",
+    "shell_init_ms",
+    "exec_launch_ms",
+    "py_init_ms",
+    "probe_ms",
+]
 TURN_METRICS = ["pre_create_ms", "turn_to_shell_ms", "turn_to_native_ms"]
 
 
@@ -56,13 +64,16 @@ def call_rows(probes: list[dict], markers: dict[int, int], mode: str) -> list[di
                 "pre_create_ms": None
                 if reused
                 else timing.diff_ms(shell_create, anchor),
+                "shell_to_exec_ms": None
+                if reused
+                else timing.diff_ms(py_create, shell_create),
                 "shell_init_ms": None
                 if reused
                 else timing.diff_ms(ready, shell_create),
                 "exec_launch_ms": timing.diff_ms(py_create, ready),
                 "py_init_ms": timing.diff_ms(probe["py_t0_ns"], py_create),
                 "probe_ms": timing.diff_ms(probe["probe_end_ns"], probe["py_t0_ns"]),
-                "turn_to_shell_ms": timing.diff_ms(ready or py_create, anchor),
+                "turn_to_shell_ms": timing.diff_ms(py_create, anchor),
                 "turn_to_native_ms": timing.diff_ms(
                     markers.get(seq + 1), probe["probe_end_ns"]
                 ),
@@ -71,6 +82,33 @@ def call_rows(probes: list[dict], markers: dict[int, int], mode: str) -> list[di
         )
         prev_end = probe["probe_end_ns"]
     return rows
+
+
+def validate(
+    meta: dict, probes: list[dict], markers: dict[int, int], rows: list[dict]
+) -> list[str]:
+    """Problems that mean the agent didn't follow the prompt (failed, retried,
+    skipped, or reordered steps), so the run's timings aren't comparable."""
+    if not probes:
+        return ["no probes recorded"]
+    calls = meta.get("calls", len(rows))
+    expected = set(range(1, calls + 1))
+    seqs = [p["seq"] for p in probes]
+    issues = []
+    if missing := sorted(expected - set(seqs)):
+        issues.append(f"missing probes {missing}")
+    if repeated := sorted({s for s in seqs if seqs.count(s) > 1}):
+        issues.append(f"repeated probes {repeated}")
+    if meta.get("mode", "alternate") != "alternate":
+        return issues
+    if missing_markers := sorted(set(range(1, calls + 2)) - set(markers)):
+        issues.append(f"missing markers {missing_markers}")
+    for row in rows:
+        if (row["turn_to_shell_ms"] or 0) < 0:
+            issues.append(f"probe {row['seq']} ran before marker {row['seq']}")
+        if (row["turn_to_native_ms"] or 0) < 0:
+            issues.append(f"marker {row['seq'] + 1} written before probe {row['seq']}")
+    return issues
 
 
 def summarize_run(run_path: Path, include_first: bool = False) -> dict | None:
@@ -86,10 +124,16 @@ def summarize_run(run_path: Path, include_first: bool = False) -> dict | None:
         "rows": rows,
         "n": len(rows),
         "markers": len(markers),
+        "issues": validate(meta, probes, markers, rows),
     }
     for metric in TOOL_METRICS + TURN_METRICS:
         summary[metric] = stats.summarize(r[metric] for r in steady)
     summary["reused"] = sum(r["reused_shell"] for r in rows)
+    observed = [r["shell"] for r in rows if r["shell"]]
+    summary["shell"] = (
+        max(set(observed), key=observed.count) if observed else meta.get("shell")
+    )
+    summary["ready_missing"] = sum(1 for p in probes if p.get("shell_ready_ns") is None)
     shell_turn = summary["turn_to_shell_ms"]["median"]
     native_turn = summary["turn_to_native_ms"]["median"]
     summary["shell_overhead_ms"] = (

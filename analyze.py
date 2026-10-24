@@ -13,6 +13,7 @@ from harnessbench import analysis, runs, stats
 
 DETAIL_COLUMNS = [
     "pre_create_ms",
+    "shell_to_exec_ms",
     "shell_init_ms",
     "exec_launch_ms",
     "py_init_ms",
@@ -21,6 +22,7 @@ DETAIL_COLUMNS = [
     "turn_to_native_ms",
 ]
 SUMMARY_COLUMNS = [
+    ("shell_to_exec", "shell_to_exec_ms"),
     ("shell_init", "shell_init_ms"),
     ("exec", "exec_launch_ms"),
     ("py_init", "py_init_ms"),
@@ -33,14 +35,20 @@ SUMMARY_COLUMNS = [
 def agent_runs() -> list[dict]:
     summaries = []
     for path in sorted(runs.RUNS_DIR.glob("*/meta.json")):
-        summary = analysis.summarize_run(path.parent)
-        if summary and summary["n"]:
+        if summary := analysis.summarize_run(path.parent):
             summaries.append(summary)
     return summaries
 
 
+def print_invalid(invalid: list[dict], included: bool) -> None:
+    action = "included above" if included else "excluded; use --include-invalid to show"
+    print(f"\n## Invalid agent runs ({action})")
+    for s in invalid:
+        print(f"{s['meta']['run_id']}: {'; '.join(s['issues'])}")
+
+
 def print_agent_runs(summaries: list[dict]) -> None:
-    headers = ["run", "env", "harness", "model", "shell", "n", "reused"]
+    headers = ["run", "env", "harness", "model", "shell", "valid", "n", "reused"]
     headers += [label for label, _ in SUMMARY_COLUMNS] + [
         "shell_overhead",
         "turn_shell_p90",
@@ -54,7 +62,8 @@ def print_agent_runs(summaries: list[dict]) -> None:
             meta["env"],
             meta["harness"],
             meta["model"],
-            meta["shell"],
+            s["shell"],
+            "no" if s["issues"] else "yes",
         ]
         row += [str(s["n"]), str(s["reused"])]
         row += [stats.fmt(s[key]["median"]) for _, key in SUMMARY_COLUMNS]
@@ -65,7 +74,7 @@ def print_agent_runs(summaries: list[dict]) -> None:
         ]
         rows.append(row)
     print("## Agent runs (medians in ms, first call excluded)")
-    print(stats.render_table(headers, rows, text_cols=5))
+    print(stats.render_table(headers, rows, text_cols=6))
 
 
 def print_run_detail(run_id: str) -> None:
@@ -73,6 +82,8 @@ def print_run_detail(run_id: str) -> None:
     if summary is None:
         raise SystemExit(f"no run {run_id}")
     print(f"## {run_id}  ({summary['n']} probes, {summary['markers']} markers)")
+    for issue in summary["issues"]:
+        print(f"INVALID: {issue}")
     headers = [
         "seq",
         "shell",
@@ -92,6 +103,12 @@ def print_run_detail(run_id: str) -> None:
     print(
         f"shell_overhead_ms (median turn_to_shell - median turn_to_native): {stats.fmt(summary['shell_overhead_ms'])}"
     )
+    if summary["ready_missing"]:
+        print(
+            f"note: {summary['ready_missing']} probes have no shell-ready timestamp "
+            "(e.g. macOS /bin/bash 3.2 lacks $EPOCHREALTIME); shell_init and exec_launch "
+            "are blank, use shell_to_exec instead"
+        )
     if summary["first_tool_ms"] is not None:
         print(f"launch -> first tool call: {stats.fmt(summary['first_tool_ms'])} ms")
 
@@ -245,6 +262,7 @@ def write_csv(summaries: list[dict], path: Path) -> None:
         "harness",
         "model",
         "shell",
+        "issues",
         "n",
         "reused",
         "shell_overhead_ms",
@@ -260,9 +278,9 @@ def write_csv(summaries: list[dict], path: Path) -> None:
         writer.writeheader()
         for s in summaries:
             row = {
-                key: s["meta"].get(key)
-                for key in ("run_id", "env", "harness", "model", "shell")
+                key: s["meta"].get(key) for key in ("run_id", "env", "harness", "model")
             }
+            row |= {"shell": s["shell"], "issues": "; ".join(s["issues"])}
             row |= {
                 key: s[key] for key in ("n", "reused", "shell_overhead_ms", "wall_s")
             }
@@ -279,13 +297,24 @@ def main() -> int:
     )
     parser.add_argument("--run", help="per-call detail for one agent run")
     parser.add_argument("--csv", type=Path, help="write agent-run summary CSV")
+    parser.add_argument(
+        "--include-invalid",
+        action="store_true",
+        help="include runs with failed/skipped/reordered steps (except empty runs)",
+    )
     args = parser.parse_args()
     if args.run:
         print_run_detail(args.run)
         return 0
-    summaries = agent_runs()
+    all_runs = agent_runs()
+    invalid = [s for s in all_runs if s["issues"]]
+    summaries = [
+        s for s in all_runs if s["n"] and (args.include_invalid or not s["issues"])
+    ]
     if summaries:
         print_agent_runs(summaries)
+    if invalid:
+        print_invalid(invalid, args.include_invalid)
     print_spawn()
     print_idle_effect()
     print_net()

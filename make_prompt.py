@@ -41,16 +41,13 @@ def invoke(shell: str, python: str, script: str, script_args: str) -> str:
 
 def probe_command(shell: str, python: str, run_id: str, seq: int) -> str:
     args = f"--run {run_id} --seq {seq}"
-    match shell:
-        case "powershell" | "pwsh":
-            call = invoke(shell, python, "probe.py", f"{args} --ready-ticks $t")
-            return f"$t=[DateTime]::UtcNow.Ticks; {call}"
-        case "zsh":
-            call = invoke(shell, python, "probe.py", f'{args} --ready-epoch "$t"')
-            return f"zmodload zsh/datetime; t=$EPOCHREALTIME; {call}"
-        case _:
-            call = invoke(shell, python, "probe.py", f'{args} --ready-epoch "$t"')
-            return f"t=$EPOCHREALTIME; {call}"
+    if shell in ("powershell", "pwsh"):
+        call = invoke(shell, python, "probe.py", f"{args} --ready-ticks $t")
+        return f"$t=[DateTime]::UtcNow.Ticks; {call}"
+    # Harnesses don't always use the login shell, so one command must work in zsh and bash.
+    # bash < 5 (macOS /bin/bash) has no $EPOCHREALTIME; the probe then records no ready time.
+    call = invoke(shell, python, "probe.py", f'{args} --ready-epoch "$t"')
+    return f'[ -n "$ZSH_VERSION" ] && zmodload zsh/datetime; t=$EPOCHREALTIME; {call}'
 
 
 def marker_content(seq: int, target_len: int) -> str:
@@ -93,6 +90,7 @@ def build_prompt(steps: list[str]) -> str:
 Rules:
 - Perform the steps strictly in order, ONE tool call per step. Wait for each to finish before starting the next.
 - Never run tool calls in parallel, never combine steps, never modify the commands.
+- Use ONLY your built-in file-write tool and your built-in terminal tool. Never use MCP tools or any other tools.
 - Do not read, list, search, or explore any files. Do not plan, make todo lists, or explain anything between steps.
 - WRITE steps: use your file-creation/edit tool (NOT the terminal) to create the file with exactly the given content.
 - RUN steps: use your terminal/shell tool to run the command exactly as written, in the foreground.
