@@ -113,7 +113,7 @@ def validate(
 
 def summarize_run(run_path: Path, include_first: bool = False) -> dict | None:
     meta = runs.read_json(run_path / "meta.json")
-    if meta is None:
+    if meta is None or meta.get("benchmark", "dispatch") != "dispatch":
         return None
     probes = runs.read_jsonl(run_path / "probe.jsonl")
     markers = marker_times(run_path)

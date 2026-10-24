@@ -1,7 +1,7 @@
 """Summarize everything under runs/ (copy runs/ from every machine into one place first).
 
-python analyze.py                 # one row per agent run + spawn/net/llm comparisons
-python analyze.py --run <id>      # per-tool-call breakdown for one agent run
+python analyze.py                 # dispatch + completion runs, spawn/net/llm comparisons
+python analyze.py --run <id>      # per-tool-call breakdown for one agent run (either benchmark)
 python analyze.py --csv out.csv   # agent-run summary as CSV
 """
 
@@ -9,7 +9,7 @@ import argparse
 import csv
 from pathlib import Path
 
-from harnessbench import analysis, runs, stats
+from harnessbench import analysis, completion, runs, stats
 
 DETAIL_COLUMNS = [
     "pre_create_ms",
@@ -32,6 +32,15 @@ SUMMARY_COLUMNS = [
 ]
 
 
+VARIANT_COLUMNS = [
+    ("run", "run_ms"),
+    ("dispatch", "dispatch_ms"),
+    ("detect", "detect_ms"),
+    ("detect_p90", "detect_p90"),
+    ("excess", "excess_ms"),
+]
+
+
 def agent_runs() -> list[dict]:
     summaries = []
     for path in sorted(runs.RUNS_DIR.glob("*/meta.json")):
@@ -40,11 +49,79 @@ def agent_runs() -> list[dict]:
     return summaries
 
 
-def print_invalid(invalid: list[dict], included: bool) -> None:
+def completion_runs() -> list[dict]:
+    summaries = []
+    for path in sorted(runs.RUNS_DIR.glob("*/meta.json")):
+        if summary := completion.summarize_run(path.parent):
+            summaries.append(summary)
+    return summaries
+
+
+def print_invalid(invalid: list[dict], included: bool, kind: str) -> None:
     action = "included above" if included else "excluded; use --include-invalid to show"
-    print(f"\n## Invalid agent runs ({action})")
+    print(f"\n## Invalid {kind} runs ({action})")
     for s in invalid:
         print(f"{s['meta']['run_id']}: {'; '.join(s['issues'])}")
+
+
+def variant_table(variants: list[dict]) -> str:
+    headers = [
+        "variant",
+        "n",
+        *(label for label, _ in VARIANT_COLUMNS),
+        "early",
+        "killed",
+    ]
+    rows = [
+        [
+            v["variant"],
+            str(v["n"]),
+            *(stats.fmt(v[key]) for _, key in VARIANT_COLUMNS),
+            str(v["early"]),
+            str(v["killed"]),
+        ]
+        for v in variants
+    ]
+    return stats.render_table(headers, rows)
+
+
+def print_completion(summaries: list[dict], include_invalid: bool) -> None:
+    shown = [s for s in summaries if s["n"] and (include_invalid or not s["issues"])]
+    groups = stats.group_by(
+        shown, lambda s: (s["meta"]["env"], s["meta"]["harness"], s["meta"]["model"])
+    )
+    for (env, harness, model), group in sorted(groups.items()):
+        rows = [row for s in group for row in s["rows"]]
+        print(
+            f"\n## Completion detection: {env} / {harness} / {model} "
+            f"({len(group)} runs, medians in ms, excess vs '{completion.BASELINE}')"
+        )
+        print(variant_table(completion.variant_summary(rows)))
+    if invalid := [s for s in summaries if s["issues"]]:
+        print_invalid(invalid, include_invalid, "completion")
+
+
+def print_completion_detail(summary: dict) -> None:
+    meta = summary["meta"]
+    print(f"## {meta['run_id']}  ({summary['n']} probes, {summary['markers']} markers)")
+    for issue in summary["issues"]:
+        print(f"INVALID: {issue}")
+    headers = ["seq", "variant", "run", "dispatch", "detect", "after_child", "flags"]
+    rows = [
+        [
+            str(r["seq"]),
+            r["variant"],
+            stats.fmt(r["run_ms"]),
+            stats.fmt(r["dispatch_ms"]),
+            stats.fmt(r["detect_ms"]),
+            stats.fmt(r["after_child_ms"]),
+            " ".join(flag for flag in ("early", "killed") if r[flag]),
+        ]
+        for r in summary["rows"]
+    ]
+    print(stats.render_table(headers, rows, text_cols=2))
+    print(f"\n## Per variant (medians in ms, excess vs '{completion.BASELINE}')")
+    print(variant_table(summary["variants"]))
 
 
 def print_agent_runs(summaries: list[dict]) -> None:
@@ -73,7 +150,7 @@ def print_agent_runs(summaries: list[dict]) -> None:
             stats.fmt(s["wall_s"], 1),
         ]
         rows.append(row)
-    print("## Agent runs (medians in ms, first call excluded)")
+    print("## Dispatch runs (medians in ms, first call excluded)")
     print(stats.render_table(headers, rows, text_cols=6))
 
 
@@ -304,7 +381,10 @@ def main() -> int:
     )
     args = parser.parse_args()
     if args.run:
-        print_run_detail(args.run)
+        if summary := completion.summarize_run(runs.RUNS_DIR / args.run):
+            print_completion_detail(summary)
+        else:
+            print_run_detail(args.run)
         return 0
     all_runs = agent_runs()
     invalid = [s for s in all_runs if s["issues"]]
@@ -314,7 +394,8 @@ def main() -> int:
     if summaries:
         print_agent_runs(summaries)
     if invalid:
-        print_invalid(invalid, args.include_invalid)
+        print_invalid(invalid, args.include_invalid, "dispatch")
+    print_completion(completion_runs(), args.include_invalid)
     print_spawn()
     print_idle_effect()
     print_net()

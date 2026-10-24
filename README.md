@@ -23,6 +23,15 @@ This kit separates those components so each variable can be tested on its own:
 the same harness and model across environments, the same environment and model
 across harnesses, or the same environment and harness across models.
 
+There are two agent benchmarks, both run by pasting a generated prompt into the
+harness:
+
+- **Dispatch** (`make_prompt.py`): how long it takes from the agent deciding to
+  run a command to the command actually starting.
+- **Completion detection** (`make_completion_prompt.py`): how long it takes from
+  a command finishing to the harness noticing and the agent moving on, for kinds
+  of command that harnesses often handle badly.
+
 Everything uses only the Python standard library, so nothing needs to be
 installed on locked-down machines.
 
@@ -85,8 +94,10 @@ and `shell_init` aren't reported for them.
 
 | Script | Run by | Purpose |
 |---|---|---|
-| `make_prompt.py` | you | Creates a run folder and prints the prompt to paste into the harness |
+| `make_prompt.py` | you | Creates a dispatch run and prints the prompt to paste into the harness |
 | `probe.py` | the agent | Records the timestamps above for one shell tool call |
+| `make_completion_prompt.py` | you | Creates a completion-detection run and prints its prompt |
+| `complete_probe.py` | the agent | Runs one command-behavior variant and records when it exited |
 | `spawn_bench.py` | you (optionally the agent) | Times starting shells, Python, git, node, and new scripts |
 | `net_probe.py` | you | Times DNS, TCP, proxy, TLS, and first byte; shows certificate issuer and HTTP/2 support |
 | `llm_probe.py` | you | Calls the provider API directly: time to first token, tokens/s, stream buffering |
@@ -116,7 +127,7 @@ and `shell_init` aren't reported for them.
 The examples below use `python` for the virtual environment's interpreter
 (`./.venv/bin/python` on macOS/Linux/WSL, `.\.venv\Scripts\python.exe` on Windows).
 
-## Running an agent benchmark
+## Running the dispatch benchmark
 
 1. Generate a prompt:
 
@@ -177,6 +188,88 @@ python launch.py --run <run-id> -- opencode run {prompt}
 
 Check each CLI's own flags for non-interactive mode and auto-approval. Pasting the
 prompt manually works too; you just don't get the submit-time measurement.
+
+## Completion-detection benchmark
+
+Harnesses decide a terminal command is finished in different ways: the process
+exiting, its output stream closing, shell-integration markers in a terminal, the
+output going quiet for a while, or a timeout. Some kinds of command confuse
+some of those methods, and the harness then waits longer than it needs to, or
+returns before the command has finished.
+
+### How it works
+
+The prompt alternates the same native WRITE step with RUN steps that execute
+`complete_probe.py` with one **variant**. The probe records the exact moment it
+exits, and the next marker file's modification time shows when the agent moved
+on. That gap is "harness notices completion" plus a model turn. The model turn
+is the same kind of tiny step every time, so subtracting the gap for the plain
+`line` baseline leaves the harness's extra completion-detection cost for that
+variant. Variants run in shuffled rounds so drift over the run affects all of
+them equally.
+
+| Variant | What the command does | What it tests |
+|---|---|---|
+| `line` | Prints one line | Baseline |
+| `silent` | Prints nothing | Harnesses that wait for output |
+| `many-lines` | Prints 1,000 short lines | Output streaming and rendering |
+| `no-newline` | Output without a trailing newline | Prompt / end-of-output detection in terminals |
+| `progress` | Carriage-return progress bar for about 1 s | Terminal rendering of `\r` updates |
+| `drip` | One line every 250 ms for 2 s | Output arriving while the command runs |
+| `stderr` | Prints only to stderr | Separate stderr handling |
+| `exit-1` | Prints an error and exits with code 1 | Error path |
+| `sleep-2`, `sleep-10` | Silent, then one line | Polling intervals and "output went quiet" heuristics |
+| `sleep-30` | As above, 30 s (not in the default set) | Timeouts and auto-backgrounding of long commands |
+| `bg-holds-output` | Leaves a child process running for 5 s that keeps the command's output open | Harnesses that wait for the output to close rather than for the process to exit |
+| `bg-detached` | Same child, fully detached from the output | Control for `bg-holds-output` |
+
+### Running it
+
+```bash
+python make_completion_prompt.py --harness cursor-gui --model sonnet-4.5 --env mac
+python make_completion_prompt.py ... --variants line many-lines bg-holds-output --reps 5
+```
+
+| Option | Default | Notes |
+|---|---|---|
+| `--variants` | all except `sleep-30` | `line` is always added as the baseline |
+| `--reps` | 3 | Rounds through the variants. Each round is 12 RUN steps plus about 20 s of sleeps, output drips and background holds |
+| `--seed` | random | Shuffle seed, saved in `meta.json` |
+
+It also takes `--harness`, `--model`, `--env`, `--shell`, `--python` and
+`--notes`, the same as `make_prompt.py`. The harness setup is the same as for the
+dispatch benchmark: open this folder, auto-approve, fixed low reasoning, no MCP
+servers, new chat. Then check the run with `python analyze.py --run <run-id>`.
+
+### Metrics
+
+| Metric | Meaning |
+|---|---|
+| `run` | The command's own duration, from probe start to probe exit |
+| `dispatch` | Marker written to probe start; shouldn't depend on the variant |
+| `detect` | Probe exit to next marker written: completion detection plus a model turn |
+| `excess` | Median `detect` for the variant minus median `detect` for `line` |
+| `after_child` | For background variants: background child's exit to next marker written |
+| `early` | The next marker was written before the command exited: the harness returned, or moved the command to the background, before it finished |
+| `killed` | A background child never recorded its exit: the harness killed it |
+
+How to read the results:
+
+- **`bg-holds-output` excess of about 5 s, with `after_child` close to a normal
+  turn:** the harness waits for the output to close, not for the command to
+  exit. Commands that start servers or watchers in the background will stall
+  it. `bg-detached` should show no such excess.
+- **Excess on `sleep-*` growing with the duration, or always a similar fixed
+  amount:** the harness checks for completion at an interval, or waits for the
+  output to go quiet.
+- **`early` on long sleeps:** the harness gave up waiting and handed control
+  back to the model while the command was still running.
+- **Excess on `many-lines`, `progress` or `no-newline`:** slow output processing
+  or confused end-of-output detection. `many-lines` also adds about 4,000 tokens
+  to the model's input if the harness doesn't truncate it, so part of its excess
+  can be model time.
+- **Single runs are noisy:** turn-to-turn variation is a few hundred ms, so use
+  medians over several rounds and ignore excess below about 300 ms.
 
 ## Baseline benchmarks (run manually, no harness)
 
@@ -272,6 +365,7 @@ in provider load over time cancel out. Compare medians and p90.
 | Is security software slowing process startup? Does its cache expire? | machine | Windows vs WSL vs Linux VM; idle period | `spawn_bench` first/repeat, idle table, new vs same script |
 | How much do the environment and shell cost per tool call? | harness, model | corp-win PowerShell / Git Bash / WSL / VM, Mac | `shell_to_exec` (split into `shell_init` / `exec_launch`), `py_init`, `shell_overhead` |
 | Which harness has the least overhead? | environment, model | harness | `turn_native`, `shell_overhead`, `reused` |
+| Which harness notices command completion fastest, and which commands confuse it? | environment, model | harness | completion benchmark `excess`, `early`, `killed` per variant |
 | How much does the model matter? | environment, harness | model | `turn_native`, `llm_probe` time to first token and tokens/s |
 | Is Cursor's "taking longer than normal" local or backend? | harness = Cursor, model | Mac vs corp-win, in the same hour | `turn_native`, `net_probe` issuer/HTTP/2/api2.cursor.sh, `llm_probe` buffering |
 
@@ -283,22 +377,25 @@ path (proxy, TLS inspection, no HTTP/2) or to the machine itself.
 
 All results are written under `runs/`, which is git-ignored:
 
-- `runs/<run-id>/`: one agent run (`meta.json`, `prompt.txt`, `probe.jsonl`,
-  `markers/`, and optionally `spawn.jsonl` and `launch.json`)
+- `runs/<run-id>/`: one agent run (`meta.json`, `prompt.txt`, `markers/`, and
+  `probe.jsonl` for dispatch runs or `complete.jsonl` for completion runs, plus
+  optionally `spawn.jsonl` and `launch.json`)
 - `runs/spawn/`, `runs/net/`, `runs/llm/`: baseline results, one JSONL file per
   invocation
 
 Copy `runs/` from every machine into one checkout, then:
 
 ```bash
-python analyze.py                     # all agent runs + spawn/net/LLM comparisons
-python analyze.py --run <run-id>      # per-call breakdown for one run
-python analyze.py --csv summary.csv   # agent-run summary for spreadsheets
+python analyze.py                     # dispatch + completion runs, spawn/net/LLM comparisons
+python analyze.py --run <run-id>      # per-call breakdown for one run (either benchmark)
+python analyze.py --csv summary.csv   # dispatch-run summary for spreadsheets
 python analyze.py --include-invalid   # also show runs that failed validation
 ```
 
-Agent-run summaries exclude the first call, which includes cold-start effects.
-The per-run detail view includes it.
+Dispatch summaries exclude the first call, which includes cold-start effects.
+The per-run detail view includes it. Completion results are pooled across all
+valid runs with the same environment, harness and model, with one row per
+variant.
 
 Each agent run is checked against its prompt. A run is invalid if any of these
 happened:
@@ -307,6 +404,10 @@ happened:
 - marker files are missing (a failed or skipped write, e.g. an attempt through
   an MCP tool)
 - steps ran out of order (e.g. tool calls made in parallel)
+- completion runs only: a probe ran a different variant from the one planned
+
+In completion runs, `early` is a finding, not a failure, so it doesn't make a run
+invalid.
 
 Invalid runs are listed with their problems and left out of the summary table and
 CSV unless `--include-invalid` is given. Runs with no probes at all are never
@@ -340,9 +441,11 @@ shown in the table.
 ## Project layout
 
 ```text
-harnessbench/      shared library: process info, timing, run storage, stats, analysis
-probe.py           agent-invoked tool-call probe
-make_prompt.py     creates a run and its prompt
+harnessbench/      shared library: process info, timing, prompts, run storage, stats, analysis
+probe.py           agent-invoked dispatch probe
+make_prompt.py     creates a dispatch run and its prompt
+complete_probe.py  agent-invoked completion-detection probe (command-behavior variants)
+make_completion_prompt.py  creates a completion-detection run and its prompt
 spawn_bench.py     process-spawn baseline
 net_probe.py       network-path baseline
 llm_probe.py       direct LLM API baseline
